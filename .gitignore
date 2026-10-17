@@ -1,0 +1,16 @@
+# Build outputs
+adbd-standalone/build-*/
+adbd-standalone/sysroot-aarch64/
+adbd-standalone/pkg/
+adbd-standalone/src/
+*.pkg.tar.zst
+*.pkg.tar.xz
+
+# The AOSP tree is a partial checkout fetched separately (see README).
+/aosp-adbd/
+
+# Editors / OS
+.vscode/
+.idea/
+*~
+a.out

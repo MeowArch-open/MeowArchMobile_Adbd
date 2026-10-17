@@ -1,0 +1,17 @@
+# adbd-meowarch install hook
+# Suggest enabling the service after install.
+
+post_install() {
+    echo "adbd-meowarch: enable with 'systemctl enable --now adbd'."
+    echo "  Config lives in /etc/conf.d/adbd (ADBD_PORT, ADBD_NO_AUTH)."
+    echo "  ADBD_NO_AUTH=1 lets anyone who can reach the port run shell"
+    echo "  commands — firewall it or keep it off untrusted networks."
+}
+
+post_upgrade() {
+    systemctl try-restart adbd.service 2>/dev/null || true
+}
+
+pre_remove() {
+    systemctl disable --now adbd.service 2>/dev/null || true
+}

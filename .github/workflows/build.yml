@@ -1,0 +1,146 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'adbd-standalone/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'adbd-standalone/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-native:
+    # Shakedown build: native x86_64 adbd inside an Arch container (the same
+    # distro family as the target, so libc++/clang versions match what was
+    # verified locally). Smoke-tests the binary against a system adb client.
+    name: native x86_64 smoke
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    timeout-minutes: 45
+    steps:
+      - name: Install build deps
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git clang compiler-rt libc++ libc++abi lld cmake ninja make \
+            protobuf libcap brotli zstd lz4 gcc-libs curl adb
+
+      - uses: actions/checkout@v4
+
+      - name: Fetch AOSP sources (pinned)
+        working-directory: adbd-standalone
+        run: ./scripts/fetch-aosp.sh
+
+      - name: Configure & build (native)
+        working-directory: adbd-standalone
+        run: |
+          cmake -B build-native -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build-native -j"$(nproc)"
+
+      - name: Smoke test (TCP, shell + push/pull)
+        working-directory: adbd-standalone
+        run: |
+          ADBD_NO_AUTH=1 ADBD_PORT=15555 ./build-native/adbd &
+          sleep 2
+          adb connect 127.0.0.1:15555
+          sleep 1
+          adb -s 127.0.0.1:15555 shell 'echo ok-from-adbd && uname -m'
+          echo smoke-payload > /tmp/adbd-smoke.txt
+          adb -s 127.0.0.1:15555 push /tmp/adbd-smoke.txt /tmp/
+          adb -s 127.0.0.1:15555 pull /tmp/adbd-smoke.txt /tmp/pulled.txt
+          grep -q smoke-payload /tmp/pulled.txt
+
+      - name: Upload adbd binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: adbd-x86_64
+          path: adbd-standalone/build-native/adbd
+          if-no-files-found: error
+
+  build-aarch64:
+    # The real target: cross-compile to aarch64 glibc with the Arch cross
+    # toolchain, assemble an Arch Linux ARM sysroot, package with makepkg,
+    # then smoke-test the aarch64 binary under qemu-user.
+    name: cross aarch64 (Arch Linux ARM)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    timeout-minutes: 60
+    steps:
+      - name: Install build deps
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git clang compiler-rt libc++ libc++abi lld cmake ninja make \
+            protobuf libcap brotli zstd lz4 gcc-libs curl \
+            aarch64-linux-gnu-gcc aarch64-linux-gnu-binutils \
+            qemu-user-static fakeroot sudo
+
+      - uses: actions/checkout@v4
+
+      - name: Fetch AOSP sources (pinned)
+        working-directory: adbd-standalone
+        run: ./scripts/fetch-aosp.sh
+
+      - name: Build native protoc first
+        working-directory: adbd-standalone
+        run: |
+          cmake -B build-native -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build-native -j"$(nproc)" --target protoc
+
+      - name: Assemble aarch64 sysroot
+        working-directory: adbd-standalone
+        run: |
+          # make-sysroot.sh copies the cross-gcc sysroot and overlays Arch
+          # Linux ARM aarch64 packages fetched from the TUNA mirror.
+          ./scripts/make-sysroot.sh
+
+      - name: Configure & build (cross aarch64)
+        working-directory: adbd-standalone
+        run: |
+          cmake -B build-aarch64 \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64.cmake \
+            -DHOST_PROTOC="$PWD/build-native/protobuf/protoc" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build-aarch64 -j"$(nproc)"
+
+      - name: Verify binary
+        run: |
+          file adbd-standalone/build-aarch64/adbd | tee /dev/stderr | grep -q 'ARM aarch64'
+          # dynamic deps: glibc + ALARM libs only, no libstdc++/libgcc leak
+          aarch64-linux-gnu-readelf -d adbd-standalone/build-aarch64/adbd | \
+            grep NEEDED | tee /tmp/needed.txt
+          ! grep -Eq 'libstdc\+\+|libgcc_s' /tmp/needed.txt
+
+      - name: Smoke test under qemu-user
+        working-directory: adbd-standalone
+        run: |
+          # binfmt registration needs privileges; invoke qemu directly instead.
+          qemu-aarch64-static -L sysroot-aarch64 ./build-aarch64/adbd --version
+
+      - name: Package (makepkg, arch = aarch64)
+        working-directory: adbd-standalone
+        run: |
+          # buildsrc noop: package() reads build-aarch64/adbd in place.
+          # CARCH=aarch64 makes .PKGINFO carry the target arch so the device
+          # installs it with a plain pacman -U.
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder:builder .
+          sudo -u builder bash -c 'CARCH=aarch64 makepkg -f'
+          tar --zstd -xOf adbd-meowarch-*.pkg.tar.zst .PKGINFO | grep '^arch = aarch64$'
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: adbd-meowarch-aarch64-pkg
+          path: adbd-standalone/adbd-meowarch-*.pkg.tar.zst
+          if-no-files-found: error

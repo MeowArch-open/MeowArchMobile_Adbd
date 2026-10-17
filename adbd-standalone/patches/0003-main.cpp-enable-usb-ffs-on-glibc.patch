@@ -1,0 +1,24 @@
+From: MeowArchMobile adbd standalone build
+Subject: [PATCH] main.cpp: allow FunctionFS USB on non-Android hosts
+
+The USB transport (daemon/usb.cpp) is only excluded from host builds by
+Android.bp's target.android srcs — the code itself is plain Linux (kernel
+AIO + FunctionFS ioctls + eventfd). Only the usb_init() call site in
+adbd_main() is #if defined(__ANDROID__)-guarded; drop the guard so a glibc
+adbd picks up /dev/usb-ffs/adb/ep0 when a gadget has been configured.
+The access() check makes it a no-op everywhere else.
+
+--- a/daemon/main.cpp
++++ b/daemon/main.cpp
+@@ -314,10 +314,8 @@
+     bool is_usb = false;
+
+-#if defined(__ANDROID__)
+     if (access(USB_FFS_ADB_EP0, F_OK) == 0) {
+         // Listen on USB.
+         usb_init();
+         is_usb = true;
+     }
+-#endif
+
+     // If one of these properties is set, also listen on that port.

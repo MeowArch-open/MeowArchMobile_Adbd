@@ -1,0 +1,126 @@
+# Maintainer: MeowArchMobile
+# adbd — AOSP's Android Debug Bridge daemon, built natively for Arch Linux ARM.
+#
+# Sources: this PKGBUILD is meant to run from adbd-standalone/ next to a
+# checkout of the AOSP tree (aosp-adbd/). It packs:
+#   * adbd binary from ../build-aarch64/adbd   (build with cmake/aarch64.cmake)
+#   * a systemd service listening on TCP 5555 (adb connect <device>:5555)
+#   * an optional FunctionFS gadget setup helper for USB (scripts/adbd-usb)
+#
+# Build (on the device or cross):
+#   cd adbd-standalone
+#   cmake -B build-native && cmake --build build-native -j$(nproc)   # host protoc
+#   ./scripts/make-sysroot.sh                                        # cross sysroot
+#   cmake -B build-aarch64 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64.cmake \
+#         -DHOST_PROTOC=$PWD/build-native/protobuf/protoc
+#   cmake --build build-aarch64 -j$(nproc)
+#
+# Then (on the x86_64 build host): CARCH=aarch64 makepkg -f
+# The env var survives load_makepkg_config (it re-sources /etc/makepkg.conf but
+# restores the pre-existing environment), so the .PKGINFO gets
+# "arch = aarch64" and the device installs it with a plain pacman -U.
+# (Without it the package is stamped x86_64 and pacman refuses: "software
+# package ... does not contain a valid architecture".)
+#
+# Runtime notes:
+#   * ADBD_NO_AUTH=1 disables RSA key authorization entirely — needed on a
+#     host with no framework to approve keys (patch 0002). The unit sets it.
+#     Anyone on the network can reach the device when enabled; the TCP listener
+#     therefore binds localhost by default (ADBD_LISTEN in /etc/conf.d/adbd).
+#   * ADBD_PORT (default 5555) picks the TCP port; ADBD_LISTEN overrides the
+#     full listen spec (e.g. tcp:127.0.0.1:5555).
+#   * USB: adb can also run over FunctionFS (see /usr/lib/adbd/adbd-usb).
+#     Requires a UDC and kernel configfs; run `adbd-usb` once, then restart
+#     adbd — the daemon picks the usb: transport when ADBD_USB=1.
+
+pkgname=adbd-meowarch
+pkgver=34.0.5
+pkgrel=1
+pkgdesc="AOSP adbd daemon, native glibc build for Arch Linux ARM"
+arch=('aarch64')
+url="https://android.googlesource.com/platform/packages/modules/adb/"
+license=('Apache' 'BSD' 'MIT')
+depends=('glibc' 'gcc-libs' 'libc++' 'libc++abi' 'libcap' 'brotli' 'zstd' 'lz4')
+makedepends=('cmake' 'clang' 'aarch64-linux-gnu-gcc' 'protobuf' 'ninja')
+# No conflicts with android-tools: that package ships the adb *client* (and
+# fastboot etc.), not adbd, so file sets don't overlap — keep both installed.
+backup=('etc/conf.d/adbd')
+install=adbd.install
+options=(!strip)             # keep debug info; the binary is RelWithDebInfo
+
+# Run in-place: makepkg -f inside adbd-standalone/. srcdir is unused; the
+# package() function reads the prebuilt binary from build-aarch64/ next to
+# this file.
+package() {
+    # This PKGBUILD is meant to be run in-place (makepkg -f inside
+    # adbd-standalone/), so the tree is one level up from $startdir — except
+    # under makepkg srcdir/ lives in src/, so anchor on this file's location.
+    local root
+    root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+    install -Dm755 "$root/build-aarch64/adbd" "$pkgdir/usr/bin/adbd"
+    install -Dm755 /dev/null "$pkgdir/usr/lib/adbd/adbd-usb"
+
+    cat > "$pkgdir/usr/lib/adbd/adbd-usb" <<'EOF'
+#!/bin/bash
+# Configure a FunctionFS gadget for adbd. Run as root BEFORE starting adbd;
+# the daemon then opens the usb: transport automatically (upstream checks
+# for the FunctionFS ep0 node at startup on __ANDROID__ builds; on glibc
+# builds transport comes up via ADBD_PORT instead — USB support here is
+# best-effort until a glibc usb_init() path is wired up).
+set -euo pipefail
+
+ADBD_FUNC=/sys/kernel/config/usb_gadget/adbd
+UDC="${1:-}"
+[ -n "$UDC" ] || UDC=$(ls /sys/class/udc | head -1)
+[ -n "$UDC" ] || { echo "no UDC available" >&2; exit 1; }
+
+modprobe libcomposite 2>/dev/null || true
+mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
+mkdir -p "$ADBD_FUNC/functions/ffs.adbd"
+echo 0x18d1 > "$ADBD_FUNC/idVendor"   # Google
+echo 0x4ee7 > "$ADBD_FUNC/idProduct"  # adb interface
+mkdir -p "$ADBD_FUNC/configs/c.1"
+ln -sfn "$ADBD_FUNC/functions/ffs.adbd" "$ADBD_FUNC/configs/c.1/f1"
+mkdir -p /dev/ffs-adbd
+mountpoint -q /dev/ffs-adbd || mount -t functionfs adbd /dev/ffs-adbd -o uid=2000,gid=2000
+echo "$UDC" > "$ADBD_FUNC/UDC"
+echo "gadget bound to $UDC"
+EOF
+
+    install -Dm644 /dev/null "$pkgdir/etc/conf.d/adbd"
+    cat > "$pkgdir/etc/conf.d/adbd" <<'EOF'
+# adbd-meowarch configuration
+# TCP port adbd listens on (upstream env var, read by daemon/main.cpp on
+# non-Android builds). Empty/unset = default port 5555.
+ADBD_PORT=5555
+# Optional: service.adb.listen_addrs equivalent via a property file is not
+# available off-Android; to bind localhost only, front adbd with the socket
+# unit below or firewall the port.
+# Set ADBD_NO_AUTH=1 to skip RSA key authorization (patch 0002: no framework
+# exists on a glibc host to approve keys). Enabling this lets anyone who can
+# reach the port run shell commands.
+ADBD_NO_AUTH=1
+# USB FunctionFS: run /usr/lib/adbd/adbd-usb (configures the gadget, mounts
+# functionfs) BEFORE starting adbd; the daemon then picks up the usb:
+# transport automatically. This package does not automate that yet.
+EOF
+
+    install -Dm644 /dev/null "$pkgdir/usr/lib/systemd/system/adbd.service"
+    cat > "$pkgdir/usr/lib/systemd/system/adbd.service" <<'EOF'
+[Unit]
+Description=AOSP adb daemon (native glibc build)
+After=network.target
+
+[Service]
+EnvironmentFile=/etc/conf.d/adbd
+ExecStart=/usr/bin/adbd
+Restart=on-failure
+Type=simple
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    # The adbd binary forks per-connection transports but stays in the
+    # foreground (it does not daemonize), so Type=simple is correct.
+}
