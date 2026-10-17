@@ -30,7 +30,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             git clang compiler-rt libc++ libc++abi lld cmake ninja make \
-            protobuf libcap brotli zstd lz4 gcc-libs curl adb
+            protobuf libcap brotli zstd lz4 gcc-libs curl android-tools
 
       - uses: actions/checkout@v4
 
