@@ -115,10 +115,13 @@ jobs:
       - name: Verify binary
         run: |
           file adbd-standalone/build-aarch64/adbd | tee /dev/stderr | grep -q 'ARM aarch64'
-          # dynamic deps: glibc + ALARM libs only, no libstdc++/libgcc leak
+          # dynamic deps: glibc + ALARM libs only. libgcc_s is expected
+          # (libc++ exception unwinding; ALARM gcc-libs ships it and the
+          # PKGBUILD depends on it). libstdc++ must NOT appear — that would
+          # mean the libc++ requirement was silently dropped.
           aarch64-linux-gnu-readelf -d adbd-standalone/build-aarch64/adbd | \
             grep NEEDED | tee /tmp/needed.txt
-          ! grep -Eq 'libstdc\+\+|libgcc_s' /tmp/needed.txt
+          ! grep -q 'libstdc++' /tmp/needed.txt
 
       - name: Smoke test under qemu-user
         working-directory: adbd-standalone
